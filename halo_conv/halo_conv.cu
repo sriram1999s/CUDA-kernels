@@ -84,19 +84,46 @@ __global__ void convolution_2d_kernel(const float* input, float* output, int wid
     }
 }
 
+// CPU Reference Implementation for Correctness Checking
+void cpu_convolution(const float* input, const float* mask, float* output, int width, int height) {
+    for (int r = 0; r < height; r++) {
+        for (int c = 0; c < width; c++) {
+            float sum = 0.0f;
+            for (int i = 0; i < MASK_WIDTH; i++) {
+                for (int j = 0; j < MASK_WIDTH; j++) {
+                    int cur_r = r + i - RADIUS;
+                    int cur_c = c + j - RADIUS;
+                    if (cur_r >= 0 && cur_r < height && cur_c >= 0 && cur_c < width) {
+                        sum += input[cur_r * width + cur_c] * mask[i * MASK_WIDTH + j];
+                    }
+                }
+            }
+            output[r * width + c] = sum;
+        }
+    }
+}
+
 int main() {
-    const int width = 64;
-    const int height = 64;
+    const int width = 128;   // Larger size for comprehensive check
+    const int height = 128;
     const int size = width * height * sizeof(float);
 
     // Host memory allocation
     float *h_input = (float*)malloc(size);
-    float *h_output = (float*)malloc(size);
+    float *h_output_gpu = (float*)malloc(size);
+    float *h_output_cpu = (float*)malloc(size);
     float h_mask[MASK_WIDTH * MASK_WIDTH];
 
-    // Initialize input data (simple gradient) and mask (3x3 box blur)
-    for (int i = 0; i < width * height; i++) h_input[i] = (float)(i % 255);
-    for (int i = 0; i < MASK_WIDTH * MASK_WIDTH; i++) h_mask[i] = 1.0f / 9.0f;
+    // Initialize input data with random-ish values and mask with a sharpen filter
+    for (int i = 0; i < width * height; i++) h_input[i] = (float)(rand() % 255);
+    
+    // Let's use a Sharpen mask for the check:
+    // [ 0 -1  0 ]
+    // [-1  5 -1 ]
+    // [ 0 -1  0 ]
+    h_mask[0] = 0.0f; h_mask[1] = -1.0f; h_mask[2] = 0.0f;
+    h_mask[3] = -1.0f; h_mask[4] = 5.0f; h_mask[5] = -1.0f;
+    h_mask[6] = 0.0f; h_mask[7] = -1.0f; h_mask[8] = 0.0f;
 
     // Device memory allocation
     float *d_input, *d_output;
@@ -105,38 +132,53 @@ int main() {
 
     // Copy data to device
     cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice);
-    
-    // Copy mask to constant memory
     cudaMemcpyToSymbol(c_mask, h_mask, MASK_WIDTH * MASK_WIDTH * sizeof(float));
 
     // Define Grid and Block dimensions
     dim3 dimBlock(TILE_SIZE, TILE_SIZE);
     dim3 dimGrid((width + TILE_SIZE - 1) / TILE_SIZE, (height + TILE_SIZE - 1) / TILE_SIZE);
 
-    // Launch kernel
+    // Launch GPU kernel
+    printf("Launching GPU Kernel...\n");
     convolution_2d_kernel<<<dimGrid, dimBlock>>>(d_input, d_output, width, height);
+    cudaDeviceSynchronize();
 
-    // Check for errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) printf("CUDA Error: %s\n", cudaGetErrorString(err));
+    // Run CPU reference
+    printf("Running CPU Reference implementation...\n");
+    cpu_convolution(h_input, h_mask, h_output_cpu, width, height);
 
     // Copy result back to host
-    cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_output_gpu, d_output, size, cudaMemcpyDeviceToHost);
 
-    // Simple verification (printing a small 4x4 section of the output)
-    printf("Output (Top-Left 4x4):\n");
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            printf("%6.2f ", h_output[i * width + j]);
+    // COMPREHENSIVE VERIFICATION
+    printf("Verifying results...\n");
+    double max_error = 0.0;
+    int error_count = 0;
+    const double epsilon = 1e-4;
+
+    for (int i = 0; i < width * height; i++) {
+        double diff = fabs((double)h_output_gpu[i] - (double)h_output_cpu[i]);
+        if (diff > max_error) max_error = diff;
+        if (diff > epsilon) {
+            if (error_count < 5) {
+                printf("Error at index %d: GPU=%f, CPU=%f (diff=%f)\n", i, h_output_gpu[i], h_output_cpu[i], diff);
+            }
+            error_count++;
         }
-        printf("\n");
+    }
+
+    if (error_count == 0) {
+        printf("PASS! Maximum error: %e\n", max_error);
+    } else {
+        printf("FAIL! Total errors: %d. Maximum error: %e\n", error_count, max_error);
     }
 
     // Cleanup
     cudaFree(d_input);
     cudaFree(d_output);
     free(h_input);
-    free(h_output);
+    free(h_output_gpu);
+    free(h_output_cpu);
 
     return 0;
 }
